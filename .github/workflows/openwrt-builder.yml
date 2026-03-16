@@ -4,22 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       openwrt_version:
-        description: "OpenWrt release version (e.g. 24.10.5)"
+        description: "OpenWrt release version (e.g. 25.12.0)"
         required: true
-        default: "24.10.5"
-      clean_build:
-        description: "Force clean build (slower but safer)"
-        required: false
-        default: "false"
-        type: boolean
+        default: "25.12.0"
 
 env:
-  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '24.10.5' }}
+  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '25.12.0' }}
   REPO_URL: https://github.com/openwrt/openwrt
-  PATCH_REPO: https://github.com/srt19/ZTE-E8820S
   TARGET: ramips
   SUBTARGET: mt7621
-  ARCH: mipsel_24kc
   TZ: Asia/Jakarta
 
 jobs:
@@ -62,29 +55,29 @@ jobs:
             ${{ env.REPO_URL }} openwrt
 
       # ── Apply srt19 patches ──────────────────────────────────────────────
-      - name: Apply DTS patch (mt7621_zte_e8820s.dts)
+      - name: Apply DTS patch
         run: |
           cp ZTE-E8820S/patch/mt7621_zte_e8820s.dts \
              openwrt/target/linux/ramips/dts/
 
-      - name: Apply LED patch (01_leds)
+      - name: Apply LED patch
         run: |
           sed -i -e '/^esac/i \\' \
                  -e '/^esac/r ZTE-E8820S/patch/leds.txt' \
              openwrt/target/linux/ramips/mt7621/base-files/etc/board.d/01_leds
 
-      - name: Apply image Makefile patch (mt7621.mk)
+      - name: Apply image Makefile patch
         run: |
           cat ZTE-E8820S/patch/zte.txt \
             >> openwrt/target/linux/ramips/image/mt7621.mk
 
-      - name: Apply default Wi-Fi settings (uci-defaults)
+      - name: Apply default Wi-Fi settings
         run: |
           cp ZTE-E8820S/patch/99-default-settings \
              openwrt/package/base-files/files/etc/uci-defaults/
 
       # ── Feeds ────────────────────────────────────────────────────────────
-      - name: Update & install feeds
+      - name: Update and install feeds
         working-directory: openwrt
         run: |
           ./scripts/feeds update -a
@@ -97,15 +90,10 @@ jobs:
           wget -qO .config \
             https://downloads.openwrt.org/releases/${{ env.OPENWRT_VERSION }}/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/config.buildinfo
 
-      - name: Select ZTE E8820S subtarget via menuconfig seed
+      - name: Append E8820S device selection and run defconfig
         working-directory: openwrt
         run: |
-          # Append device-specific selection on top of buildinfo config
-          cat >> .config << 'EOF'
-          CONFIG_TARGET_ramips=y
-          CONFIG_TARGET_ramips_mt7621=y
-          CONFIG_TARGET_ramips_mt7621_DEVICE_zte_e8820s=y
-          EOF
+          printf '\nCONFIG_TARGET_ramips=y\nCONFIG_TARGET_ramips_mt7621=y\nCONFIG_TARGET_ramips_mt7621_DEVICE_zte_e8820s=y\n' >> .config
           make defconfig
 
       # ── Download sources ─────────────────────────────────────────────────
@@ -113,67 +101,63 @@ jobs:
         working-directory: openwrt
         run: |
           make download -j$(nproc) V=s 2>&1 | tee /tmp/download.log
-          grep -i error /tmp/download.log || true
+          grep -i "^ERROR" /tmp/download.log || true
 
       # ── Compile ──────────────────────────────────────────────────────────
       - name: Compile firmware (multi-core)
         id: compile
         working-directory: openwrt
         run: |
-          echo "Compile with $(nproc) threads"
+          echo "Compiling with $(nproc) threads..."
           make -j$(nproc) V=s 2>&1 | tee /tmp/build.log
-          echo "status=success" >> $GITHUB_OUTPUT
+          echo "COMPILE_OK=true" >> $GITHUB_ENV
 
-      - name: Re-compile with single thread on failure
-        if: steps.compile.outcome == 'failure'
+      - name: Retry with single thread on failure
+        if: env.COMPILE_OK != 'true'
         working-directory: openwrt
         run: |
-          echo "Multi-core compile failed, retrying with -j1 for detailed logs..."
+          echo "Retrying with -j1 for detailed error output..."
           make -j1 V=s 2>&1 | tee /tmp/build-j1.log
-          echo "status=success" >> $GITHUB_OUTPUT
 
       # ── Gather artifacts ─────────────────────────────────────────────────
       - name: Collect firmware files
-        id: collect
         run: |
           FIRMWARE_DIR=openwrt/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}
-          OUTPUT_DIR=firmware_output
-          mkdir -p $OUTPUT_DIR
+          OUTPUT_DIR=$GITHUB_WORKSPACE/firmware_output
+          mkdir -p "$OUTPUT_DIR"
 
-          # Copy firmware images
           find "$FIRMWARE_DIR" -name "*zte_e8820s*" \
             \( -name "*.bin" -o -name "*.gz" \) \
-            -exec cp {} $OUTPUT_DIR/ \;
+            -exec cp {} "$OUTPUT_DIR/" \;
 
-          # Copy buildinfo for reproducibility
-          cp "$FIRMWARE_DIR"/config.buildinfo $OUTPUT_DIR/ 2>/dev/null || true
-          cp "$FIRMWARE_DIR"/sha256sums      $OUTPUT_DIR/ 2>/dev/null || true
+          cp "$FIRMWARE_DIR/config.buildinfo" "$OUTPUT_DIR/" 2>/dev/null || true
+          cp "$FIRMWARE_DIR/sha256sums"       "$OUTPUT_DIR/" 2>/dev/null || true
 
-          echo "files=$(ls $OUTPUT_DIR)" >> $GITHUB_OUTPUT
-          ls -lh $OUTPUT_DIR/
+          echo "--- Collected files ---"
+          ls -lh "$OUTPUT_DIR/"
 
-      # ── Upload to GitHub Release ─────────────────────────────────────────
+      # ── Create GitHub Release ─────────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.OPENWRT_VERSION }}-${{ github.run_number }}
-          name: "ZTE E8820S OpenWrt v${{ env.OPENWRT_VERSION }} (#${{ github.run_number }})"
+          name: "ZTE E8820S OpenWrt v${{ env.OPENWRT_VERSION }} (build ${{ github.run_number }})"
           body: |
             ## ZTE E8820S — OpenWrt v${{ env.OPENWRT_VERSION }}
 
             Built from official OpenWrt source with [srt19/ZTE-E8820S](https://github.com/srt19/ZTE-E8820S) patches.
 
             ### Installation (BREED required)
-            1. Reboot to BREED: power on router, hold reset 5 s
-            2. Connect to LAN port 1 → open `http://192.168.1.1`
-            3. Flash `*-squashfs-factory.bin` with **HC5962** layout
+            1. Power on router then hold Reset for 5 seconds
+            2. Connect PC to LAN port 1 and open http://192.168.1.1
+            3. Flash *-squashfs-factory.bin using HC5962 layout
 
             ### Default credentials
-            | | |
+            | Field | Value |
             |---|---|
             | URL | 192.168.1.1 |
             | User | root |
-            | Password | *(none — press Enter)* |
+            | Password | (none) |
             | Wi-Fi SSID | OpenWrt |
             | Wi-Fi Password | 12345678 |
           files: firmware_output/*
@@ -182,20 +166,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Upload raw artifact as fallback ─────────────────────────────────
-      - name: Upload firmware as workflow artifact (fallback)
+      # ── Upload artifact as fallback ───────────────────────────────────────
+      - name: Upload firmware as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-zte-e8820s-v${{ env.OPENWRT_VERSION }}
           path: firmware_output/
           retention-days: 7
 
-      # ── Upload build log on failure ───────────────────────────────────────
-      - name: Upload build log on failure
+      # ── Upload build logs on failure ──────────────────────────────────────
+      - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-failure
+          name: build-logs-failure
           path: |
             /tmp/build.log
             /tmp/build-j1.log
