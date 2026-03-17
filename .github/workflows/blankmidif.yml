@@ -174,47 +174,24 @@ jobs:
             echo "No customize-packages.sh found, skipping."
           fi
 
-      # ── 9. Load build config from official OpenWrt buildinfo ─────────
-      #  Downloads config.buildinfo for ramips/mt7621 from
-      #  downloads.openwrt.org, strips the multi-device/all-profile flags
-      #  (which would build firmware for hundreds of devices — very slow),
-      #  then appends the single ZTE E8820S device entry that was added
-      #  to mt7621.mk via our patch/zte.txt.
+      # ── 9. Load build config from patch/config8820s ──────────────────
+      #  Uses the curated .config from purbo/ZTE-E8820S (already checked
+      #  out at zte-repo/) — no download needed.
       - name: Load build config
         working-directory: openwrt
         run: |
-          # Strip leading 'v' from tag for the URL path (v25.12.0 → 25.12.0)
-          OW_VER="${OPENWRT_TAG#v}"
-          CONFIG_URL="https://downloads.openwrt.org/releases/${OW_VER}/targets/ramips/mt7621/config.buildinfo"
-
-          echo "Downloading base config from:"
-          echo "  $CONFIG_URL"
-          curl -fsSL "$CONFIG_URL" -o .config
-
-          # The official buildinfo targets ALL mt7621 devices simultaneously.
-          # Remove those flags so we build only the E8820S.
-          sed -i \
-            -e '/CONFIG_TARGET_MULTI_PROFILE/d' \
-            -e '/CONFIG_TARGET_ALL_PROFILES/d' \
-            -e '/CONFIG_TARGET_PER_DEVICE_ROOTFS/d' \
-            -e '/CONFIG_TARGET_DEVICE_ramips_mt7621_DEVICE_/d' \
-            -e '/CONFIG_TARGET_DEVICE_PACKAGES_ramips_mt7621_DEVICE_/d' \
-            .config
-
-          # Add single-device target: ZTE E8820S (registered via patch/zte.txt)
-          cat >> .config <<'EOF'
-          # ZTE E8820S — added by purbo/ZTE-E8820S build workflow
-          CONFIG_TARGET_DEVICE_ramips_mt7621_DEVICE_zte_e8820s=y
-          CONFIG_TARGET_DEVICE_PACKAGES_ramips_mt7621_DEVICE_zte_e8820s=""
-          EOF
-
+          CONFIG_SRC="$GITHUB_WORKSPACE/zte-repo/patch/config8820s"
+ 
+          echo "Loading config from: zte-repo/patch/config8820s"
+          cp -v "$CONFIG_SRC" .config
+ 
           echo "── Effective TARGET config ──────────────────"
           grep "^CONFIG_TARGET" .config
           echo "─────────────────────────────────────────────"
-
+ 
           # Expand all derived Kconfig symbols
           make defconfig
-
+          
       # ── 10. Cache downloaded sources ─────────────────────────────────
       - name: Cache dl/
         uses: actions/cache@v4
