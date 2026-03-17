@@ -1,0 +1,502 @@
+name: Build OpenWrt for ZTE E8820S
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: "OpenWrt release version (e.g. 25.12.0)"
+        required: true
+        default: "25.12.0"
+      extra_packages:
+        description: "Extra packages (space-separated, prefix - to remove)"
+        required: false
+        default: ""
+      use_imagebuilder:
+        description: "Skip custom kernel — use official ImageBuilder only"
+        required: false
+        default: "false"
+        type: boolean
+
+env:
+  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '25.12.0' }}
+  TARGET: ramips
+  SUBTARGET: mt7621
+  PROFILE: zte_e8820s
+  TZ: Asia/Jakarta
+
+# ============================================================
+# JOB 1 — Compile custom kernel + kmods with pre-built toolchain
+#          then hand off to Job 2 (ImageBuilder) for final image
+# ============================================================
+jobs:
+  compile-kernel:
+    name: "1/2 · Compile Kernel + kmods"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    if: ${{ github.event.inputs.use_imagebuilder != 'true' }}
+    outputs:
+      kernel_hash: ${{ steps.kernel-hash.outputs.hash }}
+
+    steps:
+      - name: Checkout ZTE-E8820S patch repository
+        uses: actions/checkout@v4
+        with:
+          repository: srt19/ZTE-E8820S
+          path: ZTE-E8820S
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/powershell /usr/share/swift /usr/lib/jvm
+          sudo docker image prune -af 2>/dev/null || true
+          df -h
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev \
+            libssl-dev python3-distutils rsync unzip zlib1g-dev \
+            file wget zstd
+
+      # ── Download pre-built toolchain ────────────────────────────────────
+      - name: Download official pre-built toolchain
+        run: |
+          BASE_URL="https://downloads.openwrt.org/releases/${{ env.OPENWRT_VERSION }}/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}"
+          wget -q "$BASE_URL/sha256sums" -O sha256sums
+          TOOLCHAIN_FILE=$(grep "openwrt-toolchain" sha256sums \
+            | awk '{print $2}' | sed 's|^\*||')
+
+          if [ -z "$TOOLCHAIN_FILE" ]; then
+            echo "ERROR: Could not find toolchain entry in sha256sums"
+            cat sha256sums; exit 1
+          fi
+
+          echo "Resolved: $TOOLCHAIN_FILE"
+          wget -q --show-progress "$BASE_URL/$TOOLCHAIN_FILE" -O "$TOOLCHAIN_FILE"
+          EXPECTED_HASH=$(grep "openwrt-toolchain" sha256sums | awk '{print $1}')
+          echo "$EXPECTED_HASH  $TOOLCHAIN_FILE" | sha256sum -c -
+
+          tar -I zstd -xf "$TOOLCHAIN_FILE"
+          TOOLCHAIN_DIR=$(ls -d openwrt-toolchain-*/ | head -1)
+          echo "TOOLCHAIN_DIR=$(realpath $TOOLCHAIN_DIR)" >> $GITHUB_ENV
+
+      # ── Clone OpenWrt + apply srt19 patches ─────────────────────────────
+      - name: Clone OpenWrt ${{ env.OPENWRT_VERSION }}
+        run: |
+          git clone --depth 1 \
+            --branch v${{ env.OPENWRT_VERSION }} \
+            https://github.com/openwrt/openwrt openwrt
+
+      - name: Apply DTS patch
+        run: |
+          cp ZTE-E8820S/patch/mt7621_zte_e8820s.dts \
+             openwrt/target/linux/ramips/dts/
+
+      - name: Apply LED patch
+        run: |
+          sed -i -e '/^esac/i \\' \
+                 -e '/^esac/r ZTE-E8820S/patch/leds.txt' \
+             openwrt/target/linux/ramips/mt7621/base-files/etc/board.d/01_leds
+
+      - name: Apply image Makefile patch
+        run: |
+          cat ZTE-E8820S/patch/zte.txt \
+            >> openwrt/target/linux/ramips/image/mt7621.mk
+
+      - name: Apply default Wi-Fi settings
+        run: |
+          cp ZTE-E8820S/patch/99-default-settings \
+             openwrt/package/base-files/files/etc/uci-defaults/
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ── Configure with external toolchain ───────────────────────────────
+      - name: Configure build
+        working-directory: openwrt
+        run: |
+          TOOLCHAIN_STAGING=$(ls -d ${{ env.TOOLCHAIN_DIR }}/staging_dir/toolchain-* | head -1)
+          TOOLCHAIN_PREFIX=$(basename "$TOOLCHAIN_STAGING" | sed 's/toolchain-//')
+
+          wget -qO .config \
+            "https://downloads.openwrt.org/releases/${{ env.OPENWRT_VERSION }}/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/config.buildinfo"
+
+          cat >> .config << EOF
+
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_zte_e8820s=y
+
+          CONFIG_EXTERNAL_TOOLCHAIN=y
+          CONFIG_TOOLCHAIN_ROOT="${{ env.TOOLCHAIN_DIR }}/staging_dir/toolchain-${TOOLCHAIN_PREFIX}"
+          CONFIG_TOOLCHAIN_PREFIX="mipsel-openwrt-linux-musl-"
+          CONFIG_TOOLCHAIN_LIBC="musl"
+          CONFIG_TOOLCHAIN_INCLUDE_KERNEL=n
+          EOF
+
+          make defconfig
+
+      - name: Download package sources
+        working-directory: openwrt
+        run: make download -j$(nproc) V=s 2>&1 | grep "^ERROR" || true
+
+      # ── Compile kernel + kmods only ──────────────────────────────────────
+      # We compile target/linux (kernel + kmods) and then all packages.
+      # The resulting bin/targets/.../packages/ becomes the kmod repo
+      # fed into the ImageBuilder in Job 2.
+      - name: Compile kernel and kernel modules
+        working-directory: openwrt
+        run: |
+          echo "Compiling kernel + kmods with $(nproc) threads..."
+          make target/linux/compile -j$(nproc) V=s 2>&1 | tee /tmp/kernel.log
+          echo "KERNEL_OK=true" >> $GITHUB_ENV
+
+      - name: Retry kernel compile with -j1 on failure
+        if: env.KERNEL_OK != 'true'
+        working-directory: openwrt
+        run: make target/linux/compile -j1 V=s 2>&1 | tee /tmp/kernel-j1.log
+
+      - name: Compile all packages (for kmod repo)
+        working-directory: openwrt
+        run: |
+          echo "Compiling packages with $(nproc) threads..."
+          make package/compile -j$(nproc) V=s 2>&1 | tee /tmp/packages.log
+          echo "PACKAGES_OK=true" >> $GITHUB_ENV
+
+      - name: Retry packages compile with -j1 on failure
+        if: env.PACKAGES_OK != 'true'
+        working-directory: openwrt
+        run: make package/compile -j1 V=s 2>&1 | tee /tmp/packages-j1.log
+
+      - name: Index compiled packages
+        working-directory: openwrt
+        run: make package/index V=s
+
+      # ── Record kernel hash (used to name the artifact) ───────────────────
+      - name: Get kernel hash
+        id: kernel-hash
+        working-directory: openwrt
+        run: |
+          HASH=$(cat build_dir/target-mipsel_24kc_musl/linux-ramips_mt7621/linux-*/include/config/kernel.release 2>/dev/null \
+            || echo "custom-$(date +%s)")
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+          echo "Kernel release: $HASH"
+
+      # ── Upload kernel + packages as artifact for Job 2 ───────────────────
+      - name: Upload kernel and packages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom-kernel-packages
+          # Contains:
+          #   bin/targets/ramips/mt7621/         ← kernel .bin files
+          #   bin/targets/ramips/mt7621/packages/ ← compiled kmods repo
+          #   bin/packages/                       ← compiled user packages
+          path: |
+            openwrt/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/packages/
+            openwrt/bin/packages/
+          retention-days: 1
+
+      - name: Upload kernel compile logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-compile-logs
+          path: |
+            /tmp/kernel.log
+            /tmp/kernel-j1.log
+            /tmp/packages.log
+            /tmp/packages-j1.log
+          retention-days: 3
+
+# ============================================================
+# JOB 2 — ImageBuilder with custom kmod repo from Job 1
+# ============================================================
+  assemble-image:
+    name: "2/2 · ImageBuilder + Custom Kernel"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    needs: compile-kernel
+    if: ${{ github.event.inputs.use_imagebuilder != 'true' }}
+
+    steps:
+      - name: Checkout ZTE-E8820S patch repository
+        uses: actions/checkout@v4
+        with:
+          repository: srt19/ZTE-E8820S
+          path: ZTE-E8820S
+
+      - name: Install ImageBuilder dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libncurses-dev zlib1g-dev gawk git \
+            gettext libssl-dev xsltproc rsync wget unzip python3 zstd
+
+      - name: Download and verify ImageBuilder
+        run: |
+          BASE_URL="https://downloads.openwrt.org/releases/${{ env.OPENWRT_VERSION }}/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}"
+          wget -q "$BASE_URL/sha256sums" -O sha256sums
+          ARCHIVE=$(grep "openwrt-imagebuilder" sha256sums \
+            | awk '{print $2}' | sed 's|^\*||')
+
+          echo "ImageBuilder: $ARCHIVE"
+          wget -q --show-progress "$BASE_URL/$ARCHIVE" -O "$ARCHIVE"
+          EXPECTED_HASH=$(grep "openwrt-imagebuilder" sha256sums | awk '{print $1}')
+          echo "$EXPECTED_HASH  $ARCHIVE" | sha256sum -c -
+
+          tar -I zstd -xf "$ARCHIVE"
+          echo "IB_DIR=$(realpath $(ls -d openwrt-imagebuilder-*/))" >> $GITHUB_ENV
+
+      # ── Inject custom kmod repo from Job 1 ──────────────────────────────
+      - name: Download custom kernel packages artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: custom-kernel-packages
+          path: custom-packages/
+
+      - name: Inject custom kmod repo into ImageBuilder
+        run: |
+          IB="$IB_DIR"
+
+          # Replace the target packages (kmods) with our custom-compiled ones.
+          # The ImageBuilder stores kmods in packages/  inside the target dir.
+          rm -rf "$IB/packages"
+          mkdir -p "$IB/packages"
+
+          # Copy target kmods (kernel-version-specific)
+          if [ -d custom-packages/packages ]; then
+            cp -r custom-packages/packages/. "$IB/packages/"
+          fi
+
+          # Copy arch packages (luci, etc.) into a local repo the IB can use
+          if [ -d custom-packages/mipsel_24kc ]; then
+            mkdir -p "$IB/packages/mipsel_24kc"
+            cp -r custom-packages/mipsel_24kc/. "$IB/packages/mipsel_24kc/"
+          fi
+
+          # Point ImageBuilder to local repo only — prevents kmod version mismatch
+          # with official repo packages built against a different kernel hash
+          cat >> "$IB/.config" << EOF
+          CONFIG_VERSION_REPO="file:///$(realpath $IB/packages)"
+          EOF
+
+          echo "--- Injected packages ---"
+          ls -lh "$IB/packages/" | head -20
+
+      # ── Custom files overlay ─────────────────────────────────────────────
+      - name: Prepare custom files overlay
+        run: |
+          mkdir -p files/etc/uci-defaults
+          cp ZTE-E8820S/patch/99-default-settings files/etc/uci-defaults/
+
+      # ── Build final image ────────────────────────────────────────────────
+      - name: Build firmware image
+        working-directory: ${{ env.IB_DIR }}
+        run: |
+          PACKAGES="luci luci-base luci-mod-admin-full luci-theme-bootstrap \
+            kmod-mt7603 kmod-mt76x2 wpad-basic-mbedtls iwinfo \
+            ${{ github.event.inputs.extra_packages }}"
+
+          make image \
+            PROFILE="${{ env.PROFILE }}" \
+            PACKAGES="$PACKAGES" \
+            FILES="${{ github.workspace }}/files" \
+            -j$(nproc) V=s 2>&1 | tee /tmp/imagebuilder.log
+
+      # ── Collect firmware ─────────────────────────────────────────────────
+      - name: Collect firmware files
+        run: |
+          OUTPUT_DIR=$GITHUB_WORKSPACE/firmware_output
+          mkdir -p "$OUTPUT_DIR"
+          find "$IB_DIR/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}" \
+            -name "*${{ env.PROFILE }}*" \
+            \( -name "*.bin" -o -name "*.gz" \) \
+            -exec cp {} "$OUTPUT_DIR/" \;
+          cp "$IB_DIR/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/sha256sums" \
+            "$OUTPUT_DIR/" 2>/dev/null || true
+          echo "--- Firmware files ---"
+          ls -lh "$OUTPUT_DIR/"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.OPENWRT_VERSION }}-${{ github.run_number }}
+          name: "ZTE E8820S OpenWrt v${{ env.OPENWRT_VERSION }} — Custom Kernel + ImageBuilder (build ${{ github.run_number }})"
+          body: |
+            ## ZTE E8820S — OpenWrt v${{ env.OPENWRT_VERSION }}
+
+            Built using **custom kernel** (pre-built toolchain) + **ImageBuilder** package assembly.
+
+            **Kernel:** compiled from source with [srt19/ZTE-E8820S](https://github.com/srt19/ZTE-E8820S) patches
+            - `mt7621_zte_e8820s.dts` — Custom DTS
+            - `leds.txt` — LED mapping
+            - `zte.txt` — Image Makefile entry
+
+            **Packages:** assembled via ImageBuilder using the custom kmod repo
+            (kmods compiled against the patched kernel — no version mismatch)
+
+            ### Installation (BREED required)
+            1. Power on router → hold Reset 5 s → release
+            2. Connect PC to LAN port 1 → open http://192.168.1.1
+            3. Flash `*-squashfs-factory.bin` using **HC5962** layout
+
+            ### Default credentials
+            | Field | Value |
+            |---|---|
+            | URL | 192.168.1.1 |
+            | User | root |
+            | Password | (none) |
+            | Wi-Fi SSID | OpenWrt |
+            | Wi-Fi Password | 12345678 |
+
+            ### Extra packages
+            `${{ github.event.inputs.extra_packages || 'none' }}`
+          files: firmware_output/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-zte-e8820s-v${{ env.OPENWRT_VERSION }}
+          path: firmware_output/
+          retention-days: 7
+
+      - name: Upload ImageBuilder log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: imagebuilder-log-failure
+          path: /tmp/imagebuilder.log
+          retention-days: 3
+
+# ============================================================
+# JOB — Official ImageBuilder only (no custom kernel)
+# ============================================================
+  imagebuilder-only:
+    name: "ImageBuilder Only (Official Kernel)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    if: ${{ github.event.inputs.use_imagebuilder == 'true' }}
+
+    steps:
+      - name: Checkout ZTE-E8820S patch repository
+        uses: actions/checkout@v4
+        with:
+          repository: srt19/ZTE-E8820S
+          path: ZTE-E8820S
+
+      - name: Install ImageBuilder dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libncurses-dev zlib1g-dev gawk git \
+            gettext libssl-dev xsltproc rsync wget unzip python3 zstd
+
+      - name: Download and verify ImageBuilder
+        run: |
+          BASE_URL="https://downloads.openwrt.org/releases/${{ env.OPENWRT_VERSION }}/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}"
+          wget -q "$BASE_URL/sha256sums" -O sha256sums
+          ARCHIVE=$(grep "openwrt-imagebuilder" sha256sums \
+            | awk '{print $2}' | sed 's|^\*||')
+
+          echo "ImageBuilder: $ARCHIVE"
+          wget -q --show-progress "$BASE_URL/$ARCHIVE" -O "$ARCHIVE"
+          EXPECTED_HASH=$(grep "openwrt-imagebuilder" sha256sums | awk '{print $1}')
+          echo "$EXPECTED_HASH  $ARCHIVE" | sha256sum -c -
+
+          tar -I zstd -xf "$ARCHIVE"
+          echo "IB_DIR=$(realpath $(ls -d openwrt-imagebuilder-*/))" >> $GITHUB_ENV
+
+      - name: Prepare custom files overlay
+        run: |
+          mkdir -p files/etc/uci-defaults
+          cp ZTE-E8820S/patch/99-default-settings files/etc/uci-defaults/
+
+      - name: Build firmware image
+        working-directory: ${{ env.IB_DIR }}
+        run: |
+          PACKAGES="luci luci-base luci-mod-admin-full luci-theme-bootstrap \
+            kmod-mt7603 kmod-mt76x2 wpad-basic-mbedtls iwinfo \
+            ${{ github.event.inputs.extra_packages }}"
+
+          make image \
+            PROFILE="${{ env.PROFILE }}" \
+            PACKAGES="$PACKAGES" \
+            FILES="${{ github.workspace }}/files" \
+            -j$(nproc) V=s 2>&1 | tee /tmp/imagebuilder.log
+
+      - name: Collect firmware files
+        run: |
+          OUTPUT_DIR=$GITHUB_WORKSPACE/firmware_output
+          mkdir -p "$OUTPUT_DIR"
+          find "$IB_DIR/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}" \
+            -name "*${{ env.PROFILE }}*" \
+            \( -name "*.bin" -o -name "*.gz" \) \
+            -exec cp {} "$OUTPUT_DIR/" \;
+          echo "--- Firmware files ---"
+          ls -lh "$OUTPUT_DIR/"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.OPENWRT_VERSION }}-ib-${{ github.run_number }}
+          name: "ZTE E8820S OpenWrt v${{ env.OPENWRT_VERSION }} — ImageBuilder Only (build ${{ github.run_number }})"
+          body: |
+            ## ZTE E8820S — OpenWrt v${{ env.OPENWRT_VERSION }} (ImageBuilder Only)
+
+            Built using the official pre-built ImageBuilder (~10 min).
+            Default Wi-Fi settings applied from [srt19/ZTE-E8820S](https://github.com/srt19/ZTE-E8820S).
+            > **Note:** Uses official kernel — DTS/LED patches not applied.
+            > Use the default (Custom Kernel) build for full srt19 patch support.
+
+            ### Installation (BREED required)
+            1. Power on router → hold Reset 5 s → release
+            2. Connect PC to LAN port 1 → open http://192.168.1.1
+            3. Flash `*-squashfs-factory.bin` using **HC5962** layout
+
+            ### Default credentials
+            | Field | Value |
+            |---|---|
+            | URL | 192.168.1.1 |
+            | User | root |
+            | Password | (none) |
+            | Wi-Fi SSID | OpenWrt |
+            | Wi-Fi Password | 12345678 |
+
+            ### Extra packages
+            `${{ github.event.inputs.extra_packages || 'none' }}`
+          files: firmware_output/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-zte-e8820s-imagebuilder-v${{ env.OPENWRT_VERSION }}
+          path: firmware_output/
+          retention-days: 7
+
+      - name: Upload ImageBuilder log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: imagebuilder-log-failure
+          path: /tmp/imagebuilder.log
+          retention-days: 3
