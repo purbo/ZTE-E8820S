@@ -1,0 +1,384 @@
+name: Build OpenWrt – ZTE E8820S (Fast)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'patch/**'
+      - 'config/.config'
+      - 'scripts/**'
+      - '.github/workflows/build-openwrt-zte-e8820s-fast.yml'
+  workflow_dispatch:
+    inputs:
+      openwrt_tag:
+        description: 'OpenWrt tag/branch (e.g. v25.12.0 atau openwrt-25.12)'
+        required: true
+        default: 'v25.12.0'
+      upload_release:
+        description: 'Create GitHub Release'
+        required: true
+        default: 'true'
+        type: boolean
+      clean_build:
+        description: 'Clean build (ignore semua cache)'
+        required: true
+        default: 'false'
+        type: boolean
+
+env:
+  OPENWRT_REPO:   https://github.com/openwrt/openwrt.git
+  OPENWRT_TAG:    ${{ github.event.inputs.openwrt_tag || 'v25.12.0' }}
+  TARGET:         ramips
+  SUBTARGET:      mt7621
+  DEVICE_PROFILE: zte_e8820s
+  TZ:             Asia/Jakarta
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+  # ── ccache settings ───────────────────────────────────────────────────
+  # Max cache size 5 GB — sisakan ruang untuk cache dl/ dan toolchain
+  CCACHE_MAXSIZE:  5G
+  CCACHE_DIR:      /home/runner/.ccache
+  CCACHE_COMPRESS: true
+
+jobs:
+  build:
+    name: Compile ZTE E8820S – OpenWrt ${{ github.event.inputs.openwrt_tag || 'v25.12.0' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Checkout repo purbo/ZTE-E8820S ────────────────────────────
+      - name: Checkout ZTE-E8820S repo
+        uses: actions/checkout@v4
+        with:
+          path: zte-repo
+
+      # ── 2. Free disk space ───────────────────────────────────────────
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get autoremove -yq --purge
+          df -hT
+
+      # ── 3. Install build dependencies ────────────────────────────────
+      - name: Install OpenWrt build dependencies
+        run: |
+          sudo timedatectl set-timezone "$TZ"
+          sudo apt-get update -qq
+          sudo apt-get install -yq \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl \
+            device-tree-compiler ecj fastjar file flex gawk gettext \
+            gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man \
+            intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev \
+            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
+            libncursesw5 libncursesw5-dev libreadline-dev libssl-dev libtool \
+            lld llvm lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch \
+            pkgconf python3 python3-pip python3-pyelftools qemu-utils re2c \
+            rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+
+      # ── 4. Clone OpenWrt source ──────────────────────────────────────
+      - name: Clone OpenWrt ${{ env.OPENWRT_TAG }}
+        run: |
+          git clone --depth=1 --branch "$OPENWRT_TAG" "$OPENWRT_REPO" openwrt
+          echo "OPENWRT_HASH=$(git -C openwrt rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+          # Versi tanpa prefix 'v' untuk URL download (v25.12.0 → 25.12.0)
+          echo "OW_VER=${OPENWRT_TAG#v}" >> "$GITHUB_ENV"
+
+      # ── 5. Restore ccache ────────────────────────────────────────────
+      #  Key: per-tag + hash .config, sehingga cache dipakai selama
+      #  OpenWrt version dan config tidak berubah.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        if: github.event.inputs.clean_build != 'true'
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.OPENWRT_TAG }}-${{ hashFiles('zte-repo/patch/config8820s') }}
+          restore-keys: |
+            ccache-${{ env.OPENWRT_TAG }}-
+            ccache-
+
+      # ── 6. Download & extract pre-built toolchain ─────────────────────
+      #  Skip compile toolchain (~30-45 menit) dengan pakai toolchain
+      #  resmi dari downloads.openwrt.org yang sudah dikompilasi.
+      #
+      #  Nama file: openwrt-toolchain-<ver>-ramips-mt7621_gcc-*_musl.Linux-x86_64.tar.zst
+      #  Letaknya di: staging_dir/toolchain-mipsel_24kc_musl
+      - name: Download pre-built toolchain
+        run: |
+          TOOLCHAIN_URL="https://downloads.openwrt.org/releases/${OW_VER}/targets/${TARGET}/${SUBTARGET}"
+
+          echo "Mencari file toolchain di $TOOLCHAIN_URL …"
+
+          # Ambil nama file toolchain dari index halaman
+          TOOLCHAIN_FILE=$(curl -fsSL "$TOOLCHAIN_URL/" \
+            | grep -o "openwrt-toolchain-[^\"]*\.tar\.zst" \
+            | head -1)
+
+          if [ -z "$TOOLCHAIN_FILE" ]; then
+            echo "⚠ Toolchain tidak ditemukan di $TOOLCHAIN_URL"
+            echo "  Akan compile toolchain dari source (lebih lama)."
+            echo "TOOLCHAIN_PREBUILT=false" >> "$GITHUB_ENV"
+          else
+            echo "Mengunduh: $TOOLCHAIN_FILE"
+            wget -q --show-progress \
+              "$TOOLCHAIN_URL/$TOOLCHAIN_FILE" \
+              -O /tmp/toolchain.tar.zst
+
+            echo "Mengekstrak toolchain …"
+            mkdir -p /tmp/toolchain-extract
+            tar -I zstd -xf /tmp/toolchain.tar.zst \
+              -C /tmp/toolchain-extract \
+              --strip-components=1
+
+            # Pindahkan ke dalam staging_dir OpenWrt
+            mkdir -p openwrt/staging_dir
+            # Cari folder toolchain-* di dalam hasil ekstrak
+            TOOLCHAIN_DIR=$(ls /tmp/toolchain-extract/ | grep "^toolchain-" | head -1)
+            if [ -n "$TOOLCHAIN_DIR" ]; then
+              mv "/tmp/toolchain-extract/$TOOLCHAIN_DIR" \
+                "openwrt/staging_dir/$TOOLCHAIN_DIR"
+              echo "✓ Toolchain dipasang di staging_dir/$TOOLCHAIN_DIR"
+            fi
+
+            # Pindahkan host tools jika ada
+            HOST_DIR=$(ls /tmp/toolchain-extract/ | grep "^host-" | head -1)
+            if [ -n "$HOST_DIR" ]; then
+              mv "/tmp/toolchain-extract/$HOST_DIR" \
+                "openwrt/staging_dir/$HOST_DIR"
+              echo "✓ Host tools dipasang di staging_dir/$HOST_DIR"
+            fi
+
+            rm -f /tmp/toolchain.tar.zst
+            echo "TOOLCHAIN_PREBUILT=true" >> "$GITHUB_ENV"
+          fi
+
+      # ── 7. Setup ccache ──────────────────────────────────────────────
+      - name: Setup ccache
+        run: |
+          ccache --set-config=max_size="${CCACHE_MAXSIZE}"
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          # Wrap compiler: arahkan cc/gcc ke ccache
+          sudo ln -sf /usr/bin/ccache /usr/local/bin/cc
+          sudo ln -sf /usr/bin/ccache /usr/local/bin/c++
+          sudo ln -sf /usr/bin/ccache /usr/local/bin/gcc
+          sudo ln -sf /usr/bin/ccache /usr/local/bin/g++
+          ccache --zero-stats
+          ccache --show-config
+
+      # ── 8. Apply patches ────────────────────────────────────────────
+      - name: Apply patches
+        working-directory: ${{ github.workspace }}
+        run: |
+          PATCH="zte-repo/patch"
+          OW="openwrt"
+
+          echo "════════════════════════════════════════"
+          echo "  Applying ZTE E8820S patches"
+          echo "════════════════════════════════════════"
+
+          # [1/4] DTS file
+          echo "[1/4] Copying DTS file …"
+          cp -v "$PATCH/mt7621_zte_e8820s.dts" \
+            "$OW/target/linux/ramips/dts/"
+
+          # [2/4] LED entries
+          echo "[2/4] Patching LED board detection …"
+          LED_SCRIPT="$OW/target/linux/ramips/mt7621/base-files/etc/board.d/01_leds"
+          if grep -q "^esac" "$LED_SCRIPT"; then
+            sed -i \
+              -e '/^esac/i \\' \
+              -e "/^esac/r $PATCH/leds.txt" \
+              "$LED_SCRIPT"
+            echo "      → injected leds.txt before 'esac'"
+          else
+            echo "      ⚠ 'esac' not found in 01_leds — skipping"
+          fi
+
+          # [3/4] Make configuration
+          echo "[3/4] Appending device image config to mt7621.mk …"
+          cat "$PATCH/zte.txt" >> "$OW/target/linux/ramips/image/mt7621.mk"
+          echo "      → appended zte.txt to mt7621.mk"
+
+          # [4/4] UCI defaults
+          echo "[4/4] Copying UCI default settings …"
+          cp -v "$PATCH/99-default-settings" \
+            "$OW/package/base-files/files/etc/uci-defaults/"
+
+          echo "════════════════════════════════════════"
+          echo "  All patches applied ✓"
+          echo "════════════════════════════════════════"
+
+      # ── 9. Customize feeds (opsional) ────────────────────────────────
+      - name: Customize feeds
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/zte-repo/scripts/customize-feeds.sh"
+          if [ -f "$SCRIPT" ]; then
+            chmod +x "$SCRIPT" && cd openwrt && bash "$SCRIPT"
+          fi
+
+      # ── 10. Update & install feeds ──────────────────────────────────
+      - name: Update & install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ── 11. Customize packages (opsional) ───────────────────────────
+      - name: Customize packages
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/zte-repo/scripts/customize-packages.sh"
+          if [ -f "$SCRIPT" ]; then
+            chmod +x "$SCRIPT" && cd openwrt && bash "$SCRIPT"
+          fi
+
+      # ── 12. Load build config dari patch/config8820s ─────────────────
+      - name: Load build config
+        working-directory: openwrt
+        run: |
+          CONFIG_SRC="$GITHUB_WORKSPACE/zte-repo/patch/config8820s"
+          echo "Loading config dari: patch/config8820s"
+          cp "$CONFIG_SRC" .config
+
+          # Aktifkan ccache di OpenWrt build system
+          echo "CONFIG_CCACHE=y" >> .config
+
+          # Jika toolchain pre-built berhasil dipasang,
+          # beritahu OpenWrt untuk skip compile toolchain
+          if [ "${TOOLCHAIN_PREBUILT}" = "true" ]; then
+            echo "CONFIG_TOOLCHAIN_PREBUILT=y" >> .config
+          fi
+
+          echo "── Effective TARGET config ──────────────────"
+          grep "^CONFIG_TARGET\|CONFIG_CCACHE\|CONFIG_TOOLCHAIN" .config
+          echo "─────────────────────────────────────────────"
+
+          make defconfig
+
+      # ── 13. Cache dl/ ────────────────────────────────────────────────
+      - name: Cache dl/
+        uses: actions/cache@v4
+        if: github.event.inputs.clean_build != 'true'
+        with:
+          path: openwrt/dl
+          key: openwrt-dl-${{ env.OPENWRT_TAG }}-${{ hashFiles('openwrt/.config') }}
+          restore-keys: |
+            openwrt-dl-${{ env.OPENWRT_TAG }}-
+            openwrt-dl-
+
+      # ── 14. Download package sources ────────────────────────────────
+      - name: Download package sources
+        working-directory: openwrt
+        run: |
+          make download -j$(nproc) 2>&1 | tee /tmp/dl.log
+          if grep -qi "error" /tmp/dl.log; then
+            echo "Retrying failed downloads …"
+            make download -j1 V=s
+          fi
+          find dl -size -1024c -delete
+
+      # ── 15. Compile ─────────────────────────────────────────────────
+      - name: Compile firmware
+        id: compile
+        working-directory: openwrt
+        run: |
+          echo "Compiling dengan $(nproc) threads …"
+          # Gunakan CCACHE_CPP2=yes untuk kompatibilitas lebih baik
+          export CCACHE_CPP2=yes
+
+          make -j$(nproc) IGNORE_ERRORS=m || {
+            echo "Multi-thread gagal, retry single-thread verbose …"
+            make -j1 V=s IGNORE_ERRORS=m
+          }
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+      # ── 16. Tampilkan ccache stats ───────────────────────────────────
+      - name: Show ccache statistics
+        if: always()
+        run: |
+          echo "════════════ ccache stats ════════════"
+          ccache --show-stats
+          echo "══════════════════════════════════════"
+
+      # ── 17. Collect firmware files ──────────────────────────────────
+      - name: Collect firmware files
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          OUTPUT_DIR="$GITHUB_WORKSPACE/firmware"
+          mkdir -p "$OUTPUT_DIR"
+          IMGDIR="openwrt/bin/targets/$TARGET/$SUBTARGET"
+
+          find "$IMGDIR" \( \
+            -name "*.bin" -o \
+            -name "*.img" -o \
+            -name "*.img.gz" -o \
+            -name "*.manifest" -o \
+            -name "*.buildinfo" -o \
+            -name "sha256sums" \
+          \) -exec cp {} "$OUTPUT_DIR/" \;
+
+          echo "── Firmware files ──────────────────────"
+          ls -lh "$OUTPUT_DIR/"
+          echo "────────────────────────────────────────"
+
+      # ── 18. Upload Actions Artifact ─────────────────────────────────
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        if: steps.compile.outputs.status == 'success'
+        with:
+          name: OpenWrt_ZTE-E8820S_${{ env.BUILD_DATE }}
+          path: firmware/
+          retention-days: 30
+
+      # ── 19. Create GitHub Release ───────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: >
+          steps.compile.outputs.status == 'success' &&
+          (github.event.inputs.upload_release == 'true' || github.event_name == 'push')
+        with:
+          tag_name: "openwrt-${{ env.OPENWRT_TAG }}-${{ env.BUILD_DATE }}"
+          name: "ZTE E8820S │ OpenWrt ${{ env.OPENWRT_TAG }} │ ${{ env.BUILD_DATE }}"
+          body: |
+            ## ZTE E8820S – OpenWrt Custom Firmware
+
+            | Field        | Value |
+            |---|---|
+            | OpenWrt      | `${{ env.OPENWRT_TAG }}` (`${{ env.OPENWRT_HASH }}`) |
+            | Target       | `ramips/mt7621` |
+            | Device       | `zte_e8820s` |
+            | Built on     | `${{ env.BUILD_DATE }}` (WIB) |
+            | Source repo  | `purbo/ZTE-E8820S` @ `${{ github.sha }}` |
+            | Toolchain    | Pre-built dari `downloads.openwrt.org` |
+            | Compiler cache | ccache (lihat build log untuk hit rate) |
+
+            ### Flash via BREED
+            1. Sambung PC ke LAN router
+            2. Tekan reset → nyalakan → tahan sampai LED berkedip
+            3. Buka `http://192.168.1.1` (BREED web UI)
+            4. **Firmware Update** → pilih `*-squashfs-factory.bin`
+            5. Flash & reboot
+            6. Login: `http://192.168.1.1` · user `root` · tanpa password
+
+            ### File
+            | File | Kegunaan |
+            |---|---|
+            | `*-squashfs-factory.bin` | Flash dari stock / BREED |
+            | `*-squashfs-sysupgrade.bin` | Upgrade dari OpenWrt |
+            | `*.manifest` | Daftar package terinstall |
+            | `*.buildinfo` | Info build |
+
+            ---
+            > 🔧 Dicompile dari [purbo/ZTE-E8820S](https://github.com/purbo/ZTE-E8820S)
+          files: firmware/*
+          draft: false
+          prerelease: false
