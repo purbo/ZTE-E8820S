@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       openwrt_tag:
-        description: 'OpenWrt tag/branch (e.g. v25.12.0 atau openwrt-25.12)'
+        description: 'OpenWrt tag/branch (e.g. v25.12.1 atau openwrt-25.12)'
         required: true
-        default: 'v25.12.0'
+        default: 'v25.12.1'
       upload_release:
         description: 'Create GitHub Release'
         required: true
@@ -27,7 +27,7 @@ on:
 
 env:
   OPENWRT_REPO:   https://github.com/openwrt/openwrt.git
-  OPENWRT_TAG:    ${{ github.event.inputs.openwrt_tag || 'v25.12.0' }}
+  OPENWRT_TAG:    ${{ github.event.inputs.openwrt_tag || 'v25.12.1' }}
   TARGET:         ramips
   SUBTARGET:      mt7621
   DEVICE_PROFILE: zte_e8820s
@@ -42,7 +42,7 @@ env:
 
 jobs:
   build:
-    name: Compile ZTE E8820S – OpenWrt ${{ github.event.inputs.openwrt_tag || 'v25.12.0' }}
+    name: Compile ZTE E8820S – OpenWrt ${{ github.event.inputs.openwrt_tag || 'v25.12.1' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -90,7 +90,7 @@ jobs:
           git clone --depth=1 --branch "$OPENWRT_TAG" "$OPENWRT_REPO" openwrt
           echo "OPENWRT_HASH=$(git -C openwrt rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
-          # Versi tanpa prefix 'v' untuk URL download (v25.12.0 → 25.12.0)
+          # Versi tanpa prefix 'v' untuk URL download (v25.12.0 → 25.12.1)
           echo "OW_VER=${OPENWRT_TAG#v}" >> "$GITHUB_ENV"
 
       # ── 5. Restore ccache ────────────────────────────────────────────
