@@ -22,7 +22,7 @@ Password = 12345678
 cp patch/mt7621_zte_e8820s.dts openwrt/target/linux/ramips/dts
 
 # LED
-sed -i -e '/^esac/i \\' -e '/^esac/r patch/leds.txt' openwrt/target/linux/ramips/mt7621/base-files/etc/board.d/01_leds
+sed -i '/esac/e cat patch/leds.txt' openwrt/target/linux/ramips/mt7621/base-files/etc/board.d/01_leds
 
 # Make configuration
 cat patch/zte.txt >> openwrt/target/linux/ramips/image/mt7621.mk
@@ -32,10 +32,11 @@ cp patch/99-default-settings openwrt/package/base-files/files/etc/uci-defaults
 ```
 
 4. Download config.buildinfo file from OpenWrt Downloads and save as .config on openwrt folder.
-Then run make menuconfig and select the subtarget as ZTE E8820S.
+Then run make menuconfig and select the Target Profile as ZTE E8820S.
 ```bash
 # e.g
-wget -O openwrt/.config https://downloads.openwrt.org/releases/24.10.5/targets/ramips/mt7621/config.buildinfo
+cd openwrt
+wget -O .config https://downloads.openwrt.org/releases/24.10.5/targets/ramips/mt7621/config.buildinfo
 
 make menuconfig
 ```
@@ -56,5 +57,4 @@ If your device using U-Boot mod use the official [ImmortalWRT Build](https://fir
 
 ### Based on
 - [Official Openwrt Firmware](https://github.com/openwrt/openwrt)
-- Github Action [P3TERX Actions-Openwrt](https://github.com/P3TERX/Actions-OpenWrt/)
 - Patch File [TwoOnefour](https://github.com/TwoOnefour/E8820S-OpenWrt) [ImmortalWRT](https://github.com/immortalwrt/immortalwrt)
