@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       openwrt_tag:
-        description: 'OpenWrt tag/branch (e.g. v25.12.1 atau openwrt-25.12)'
+        description: 'OpenWrt tag/branch (e.g. v25.12.0 atau openwrt-25.12)'
         required: true
-        default: 'v25.12.1'
+        default: 'v25.12.2'
       upload_release:
         description: 'Create GitHub Release'
         required: true
@@ -27,7 +27,7 @@ on:
 
 env:
   OPENWRT_REPO:   https://github.com/openwrt/openwrt.git
-  OPENWRT_TAG:    ${{ github.event.inputs.openwrt_tag || 'v25.12.1' }}
+  OPENWRT_TAG:    ${{ github.event.inputs.openwrt_tag || 'v25.12.2' }}
   TARGET:         ramips
   SUBTARGET:      mt7621
   DEVICE_PROFILE: zte_e8820s
@@ -42,7 +42,7 @@ env:
 
 jobs:
   build:
-    name: Compile ZTE E8820S – OpenWrt ${{ github.event.inputs.openwrt_tag || 'v25.12.1' }}
+    name: Compile ZTE E8820S – OpenWrt ${{ github.event.inputs.openwrt_tag || 'v25.12.2' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -90,7 +90,7 @@ jobs:
           git clone --depth=1 --branch "$OPENWRT_TAG" "$OPENWRT_REPO" openwrt
           echo "OPENWRT_HASH=$(git -C openwrt rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
-          # Versi tanpa prefix 'v' untuk URL download (v25.12.0 → 25.12.1)
+          # Versi tanpa prefix 'v' untuk URL download (v25.12.0 → 25.12.0)
           echo "OW_VER=${OPENWRT_TAG#v}" >> "$GITHUB_ENV"
 
       # ── 5. Restore ccache ────────────────────────────────────────────
@@ -186,12 +186,12 @@ jobs:
           echo "  Applying ZTE E8820S patches"
           echo "════════════════════════════════════════"
 
-          # [1/4] DTS file
+          # [1/5] DTS file
           echo "[1/4] Copying DTS file …"
           cp -v "$PATCH/mt7621_zte_e8820s.dts" \
             "$OW/target/linux/ramips/dts/"
 
-          # [2/4] LED entries
+          # [2/5] LED entries
           echo "[2/4] Patching LED board detection …"
           LED_SCRIPT="$OW/target/linux/ramips/mt7621/base-files/etc/board.d/01_leds"
           if grep -q "^esac" "$LED_SCRIPT"; then
@@ -204,15 +204,21 @@ jobs:
             echo "      ⚠ 'esac' not found in 01_leds — skipping"
           fi
 
-          # [3/4] Make configuration
+          # [3/5] Make configuration
           echo "[3/4] Appending device image config to mt7621.mk …"
           cat "$PATCH/zte.txt" >> "$OW/target/linux/ramips/image/mt7621.mk"
           echo "      → appended zte.txt to mt7621.mk"
 
-          # [4/4] UCI defaults
+          # [4/5] UCI defaults
           echo "[4/4] Copying UCI default settings …"
           cp -v "$PATCH/99-default-settings" \
             "$OW/package/base-files/files/etc/uci-defaults/"
+
+          # [5/5] Upgrade support — inject setelah baris 72 di platform.sh
+          echo "[5/5] Patching platform.sh for upgrade support …"
+          PLATFORM_SH="$OW/target/linux/ramips/mt7621/base-files/lib/upgrade/platform.sh"
+          sed -i "72r $PATCH/upgrade.txt" "$PLATFORM_SH"
+          echo "      → injected upgrade.txt after line 72 of platform.sh"
 
           echo "════════════════════════════════════════"
           echo "  All patches applied ✓"
