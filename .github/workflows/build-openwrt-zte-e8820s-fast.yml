@@ -336,7 +336,39 @@ jobs:
           ls -lh "$OUTPUT_DIR/"
           echo "────────────────────────────────────────"
 
-      # ── 18. Upload Actions Artifact ─────────────────────────────────
+      # ── 18. Collect & compress kmods ────────────────────────────────
+      #  Kumpulkan semua kmod (.ipk atau .apk) dari folder kmods/
+      #  lalu compress menjadi satu file kmods-<tag>-<date>.tar.gz
+      - name: Collect and compress kmods
+        id: kmods
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          IMGDIR="openwrt/bin/targets/$TARGET/$SUBTARGET"
+          KMODS_DIR="$IMGDIR/kmods"
+          KMODS_ARCHIVE="$GITHUB_WORKSPACE/firmware/kmods-${OPENWRT_TAG}-${BUILD_DATE}.tar.gz"
+
+          if [ -d "$KMODS_DIR" ] && [ -n "$(ls -A "$KMODS_DIR" 2>/dev/null)" ]; then
+            echo "Compressing kmods dari $KMODS_DIR …"
+
+            # Hitung jumlah dan total size sebelum compress
+            KMOD_COUNT=$(find "$KMODS_DIR" -name "*.ipk" -o -name "*.apk" | wc -l)
+            echo "  → $KMOD_COUNT kmod packages ditemukan"
+
+            tar -czf "$KMODS_ARCHIVE" \
+              -C "$IMGDIR" \
+              kmods/
+
+            ARCHIVE_SIZE=$(du -sh "$KMODS_ARCHIVE" | cut -f1)
+            echo "  → Archive: kmods-${OPENWRT_TAG}-${BUILD_DATE}.tar.gz ($ARCHIVE_SIZE)"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "kmod_count=$KMOD_COUNT" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠ Folder kmods/ tidak ditemukan atau kosong — skip"
+            echo "status=skip" >> "$GITHUB_OUTPUT"
+            echo "kmod_count=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 19. Upload Actions Artifact ─────────────────────────────────
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         if: steps.compile.outputs.status == 'success'
@@ -345,7 +377,7 @@ jobs:
           path: firmware/
           retention-days: 30
 
-      # ── 19. Create GitHub Release ───────────────────────────────────
+      # ── 20. Create GitHub Release ───────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: >
@@ -357,15 +389,16 @@ jobs:
           body: |
             ## ZTE E8820S – OpenWrt Custom Firmware
 
-            | Field        | Value |
+            | Field          | Value |
             |---|---|
-            | OpenWrt      | `${{ env.OPENWRT_TAG }}` (`${{ env.OPENWRT_HASH }}`) |
-            | Target       | `ramips/mt7621` |
-            | Device       | `zte_e8820s` |
-            | Built on     | `${{ env.BUILD_DATE }}` (WIB) |
-            | Source repo  | `purbo/ZTE-E8820S` @ `${{ github.sha }}` |
-            | Toolchain    | Pre-built dari `downloads.openwrt.org` |
-            | Compiler cache | ccache (lihat build log untuk hit rate) |
+            | OpenWrt        | `${{ env.OPENWRT_TAG }}` (`${{ env.OPENWRT_HASH }}`) |
+            | Target         | `ramips/mt7621` |
+            | Device         | `zte_e8820s` |
+            | Built on       | `${{ env.BUILD_DATE }}` (WIB) |
+            | Source repo    | `purbo/ZTE-E8820S` @ `${{ github.sha }}` |
+            | Toolchain      | Pre-built dari `downloads.openwrt.org` |
+            | Compiler cache | ccache |
+            | kmod packages  | ${{ steps.kmods.outputs.kmod_count }} modules |
 
             ### Flash via BREED
             1. Sambung PC ke LAN router
@@ -375,16 +408,33 @@ jobs:
             5. Flash & reboot
             6. Login: `http://192.168.1.1` · user `root` · tanpa password
 
+            ### Install kmod dari kmods archive
+            ```sh
+            # Extract dulu di router atau akses langsung dari URL release
+            wget <url-release>/kmods-${{ env.OPENWRT_TAG }}-${{ env.BUILD_DATE }}.tar.gz
+            tar -xzf kmods-*.tar.gz -C /tmp/
+            apk add --allow-untrusted /tmp/kmods/kmod-nf-conntrack-netlink*.apk
+            ```
+
             ### File
             | File | Kegunaan |
             |---|---|
             | `*-squashfs-factory.bin` | Flash dari stock / BREED |
             | `*-squashfs-sysupgrade.bin` | Upgrade dari OpenWrt |
+            | `kmods-*.tar.gz` | Semua kernel modules (install manual) |
             | `*.manifest` | Daftar package terinstall |
             | `*.buildinfo` | Info build |
 
             ---
             > 🔧 Dicompile dari [purbo/ZTE-E8820S](https://github.com/purbo/ZTE-E8820S)
-          files: firmware/*
+          files: |
+            firmware/*.bin
+            firmware/*.img
+            firmware/*.img.gz
+            firmware/*.manifest
+            firmware/*.buildinfo
+            firmware/sha256sums
+            firmware/kmods-*.tar.gz
           draft: false
           prerelease: false
+
