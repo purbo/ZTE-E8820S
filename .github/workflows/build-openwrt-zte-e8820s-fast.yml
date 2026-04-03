@@ -336,6 +336,52 @@ jobs:
           ls -lh "$OUTPUT_DIR/"
           echo "────────────────────────────────────────"
 
+      # ── 17b. Generate APKINDEX untuk kmod repo ──────────────────────
+      - name: Generate kmod APKINDEX
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          PKGS_DIR="openwrt/bin/targets/$TARGET/$SUBTARGET/packages"
+
+          # Cari apk host binary di staging_dir
+          APK_HOST=""
+          for candidate in \
+            "openwrt/staging_dir/host/bin/apk" \
+            "openwrt/staging_dir/host/usr/bin/apk"
+          do
+            if [ -x "$candidate" ]; then
+              APK_HOST="$candidate"
+              break
+            fi
+          done
+
+          # Fallback: cari rekursif
+          if [ -z "$APK_HOST" ]; then
+            APK_HOST=$(find openwrt/staging_dir/host -name "apk" -type f -perm -u+x 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$APK_HOST" ]; then
+            echo "✗ apk host binary tidak ditemukan di staging_dir/host/"
+            echo "  APKINDEX tidak akan di-generate — kmods tar.gz tetap dibuat tanpa index"
+            exit 0
+          fi
+
+          echo "✓ Menggunakan: $APK_HOST"
+          "$APK_HOST" --version
+
+          KMOD_COUNT=$(ls "$PKGS_DIR"/kmod-*.apk 2>/dev/null | wc -l)
+          if [ "$KMOD_COUNT" -eq 0 ]; then
+            echo "⚠ Tidak ada kmod-*.apk di $PKGS_DIR — skip generate index"
+            exit 0
+          fi
+
+          echo "Generate APKINDEX dari $KMOD_COUNT kmod-*.apk …"
+          "$APK_HOST" mkndx \
+            --output "$PKGS_DIR/APKINDEX.tar.gz" \
+            "$PKGS_DIR"/kmod-*.apk
+
+          echo "✓ APKINDEX.tar.gz berhasil di-generate"
+          ls -lh "$PKGS_DIR/APKINDEX.tar.gz"
+
       # ── 18. Collect & compress kmods ────────────────────────────────
       #  OpenWrt 25.12 pakai apk (bukan opkg), semua package output
       #  ada di bin/targets/ramips/mt7621/packages/ — termasuk kmod.
