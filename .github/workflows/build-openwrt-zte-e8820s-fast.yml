@@ -337,23 +337,47 @@ jobs:
           echo "────────────────────────────────────────"
 
       # ── 18. Collect & compress kmods ────────────────────────────────
-      #  Kumpulkan semua kmod (.ipk atau .apk) dari folder kmods/
-      #  lalu compress menjadi satu file kmods-<tag>-<date>.tar.gz
+      #  Struktur output OpenWrt:
+      #  bin/targets/ramips/mt7621/kmods/<kernel-ver-hash>/kmod-*.ipk
+      #  Ada satu level subfolder berisi kernel version + hash string.
       - name: Collect and compress kmods
         id: kmods
         if: steps.compile.outputs.status == 'success'
         run: |
           IMGDIR="openwrt/bin/targets/$TARGET/$SUBTARGET"
-          KMODS_DIR="$IMGDIR/kmods"
           KMODS_ARCHIVE="$GITHUB_WORKSPACE/firmware/kmods-${OPENWRT_TAG}-${BUILD_DATE}.tar.gz"
 
-          if [ -d "$KMODS_DIR" ] && [ -n "$(ls -A "$KMODS_DIR" 2>/dev/null)" ]; then
-            echo "Compressing kmods dari $KMODS_DIR …"
+          # Debug: tampilkan isi lengkap bin/targets untuk diagnosis
+          echo "── Isi $IMGDIR ──────────────────────────"
+          find "$IMGDIR" -maxdepth 3 -type d | head -20
+          echo "─────────────────────────────────────────"
 
-            # Hitung jumlah dan total size sebelum compress
-            KMOD_COUNT=$(find "$KMODS_DIR" -name "*.ipk" -o -name "*.apk" | wc -l)
+          # Cari folder kmods/ — bisa langsung atau satu level di bawah
+          KMODS_DIR=""
+          if [ -d "$IMGDIR/kmods" ]; then
+            # Cek apakah ada subfolder (kernel hash) di dalamnya
+            KVER_DIR=$(find "$IMGDIR/kmods" -mindepth 1 -maxdepth 1 -type d | head -1)
+            if [ -n "$KVER_DIR" ]; then
+              # Struktur: kmods/<kernel-version-hash>/kmod-*.ipk
+              KMODS_DIR="$KVER_DIR"
+              echo "Ditemukan kmods di: $KMODS_DIR"
+            else
+              # Struktur flat: kmods/kmod-*.ipk
+              KMODS_DIR="$IMGDIR/kmods"
+              echo "Ditemukan kmods (flat) di: $KMODS_DIR"
+            fi
+          fi
+
+          if [ -n "$KMODS_DIR" ] && [ -n "$(ls -A "$KMODS_DIR" 2>/dev/null)" ]; then
+            KMOD_COUNT=$(find "$KMODS_DIR" \( -name "*.ipk" -o -name "*.apk" \) | wc -l)
             echo "  → $KMOD_COUNT kmod packages ditemukan"
 
+            # Catat kernel version string dari nama subfolder
+            KVER=$(basename "$KMODS_DIR")
+            echo "  → Kernel version string: $KVER"
+            echo "KVER=$KVER" >> "$GITHUB_ENV"
+
+            # Compress seluruh kmods/ termasuk subfolder agar path tetap lengkap
             tar -czf "$KMODS_ARCHIVE" \
               -C "$IMGDIR" \
               kmods/
@@ -363,7 +387,8 @@ jobs:
             echo "status=success" >> "$GITHUB_OUTPUT"
             echo "kmod_count=$KMOD_COUNT" >> "$GITHUB_OUTPUT"
           else
-            echo "⚠ Folder kmods/ tidak ditemukan atau kosong — skip"
+            echo "⚠ Tidak ada kmod ditemukan — dump struktur lengkap untuk debug:"
+            find "$IMGDIR" -maxdepth 4 | head -50
             echo "status=skip" >> "$GITHUB_OUTPUT"
             echo "kmod_count=0" >> "$GITHUB_OUTPUT"
           fi
