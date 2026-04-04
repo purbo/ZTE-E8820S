@@ -375,7 +375,7 @@ jobs:
           fi
 
           echo "Generate APKINDEX dari $KMOD_COUNT kmod-*.apk …"
-          "$APK_HOST" mkndx \
+          "$APK_HOST" mkndx --allow-untrusted \
             --output "$PKGS_DIR/APKINDEX.tar.gz" \
             "$PKGS_DIR"/kmod-*.apk
 
