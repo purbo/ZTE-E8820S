@@ -336,91 +336,7 @@ jobs:
           ls -lh "$OUTPUT_DIR/"
           echo "────────────────────────────────────────"
 
-      # ── 17b. Generate APKINDEX untuk kmod repo ──────────────────────
-      - name: Generate kmod APKINDEX
-        if: steps.compile.outputs.status == 'success'
-        run: |
-          PKGS_DIR="openwrt/bin/targets/$TARGET/$SUBTARGET/packages"
-
-          # Cari apk host binary di staging_dir
-          APK_HOST=""
-          for candidate in \
-            "openwrt/staging_dir/host/bin/apk" \
-            "openwrt/staging_dir/host/usr/bin/apk"
-          do
-            if [ -x "$candidate" ]; then
-              APK_HOST="$candidate"
-              break
-            fi
-          done
-
-          # Fallback: cari rekursif
-          if [ -z "$APK_HOST" ]; then
-            APK_HOST=$(find openwrt/staging_dir/host -name "apk" -type f -perm -u+x 2>/dev/null | head -1)
-          fi
-
-          if [ -z "$APK_HOST" ]; then
-            echo "✗ apk host binary tidak ditemukan di staging_dir/host/"
-            echo "  APKINDEX tidak akan di-generate — kmods tar.gz tetap dibuat tanpa index"
-            exit 0
-          fi
-
-          echo "✓ Menggunakan: $APK_HOST"
-          "$APK_HOST" --version
-
-          KMOD_COUNT=$(ls "$PKGS_DIR"/kmod-*.apk 2>/dev/null | wc -l)
-          if [ "$KMOD_COUNT" -eq 0 ]; then
-            echo "⚠ Tidak ada kmod-*.apk di $PKGS_DIR — skip generate index"
-            exit 0
-          fi
-
-          echo "Generate APKINDEX dari $KMOD_COUNT kmod-*.apk …"
-          "$APK_HOST" mkndx --allow-untrusted \
-            --output "$PKGS_DIR/APKINDEX.tar.gz" \
-            "$PKGS_DIR"/kmod-*.apk
-
-          echo "✓ APKINDEX.tar.gz berhasil di-generate"
-          ls -lh "$PKGS_DIR/APKINDEX.tar.gz"
-
-      # ── 18. Collect & compress kmods ────────────────────────────────
-      #  OpenWrt 25.12 pakai apk (bukan opkg), semua package output
-      #  ada di bin/targets/ramips/mt7621/packages/ — termasuk kmod.
-      #  Kita filter hanya file kmod-*.apk lalu compress jadi satu archive.
-      - name: Collect and compress kmods
-        id: kmods
-        if: steps.compile.outputs.status == 'success'
-        run: |
-          IMGDIR="openwrt/bin/targets/$TARGET/$SUBTARGET"
-          PKGS_DIR="$IMGDIR/packages"
-          KMODS_ARCHIVE="$GITHUB_WORKSPACE/firmware/kmods-${OPENWRT_TAG}-${BUILD_DATE}.tar.gz"
-
-          if [ -d "$PKGS_DIR" ] && [ -n "$(ls "$PKGS_DIR"/kmod-*.apk 2>/dev/null)" ]; then
-            KMOD_COUNT=$(ls "$PKGS_DIR"/kmod-*.apk | wc -l)
-            echo "Ditemukan $KMOD_COUNT kmod-*.apk di packages/ — compressing …"
-
-            # Buat folder staging khusus kmod saja
-            mkdir -p /tmp/kmods-staging
-            cp "$PKGS_DIR"/kmod-*.apk /tmp/kmods-staging/
-
-            # Sertakan juga APKINDEX supaya apk bisa resolv dependency
-            [ -f "$PKGS_DIR/APKINDEX.tar.gz" ] && \
-              cp "$PKGS_DIR/APKINDEX.tar.gz" /tmp/kmods-staging/
-
-            tar -czf "$KMODS_ARCHIVE" \
-              -C /tmp/kmods-staging \
-              .
-
-            ARCHIVE_SIZE=$(du -sh "$KMODS_ARCHIVE" | cut -f1)
-            echo "  → kmods-${OPENWRT_TAG}-${BUILD_DATE}.tar.gz ($ARCHIVE_SIZE)"
-            echo "status=success" >> "$GITHUB_OUTPUT"
-            echo "kmod_count=$KMOD_COUNT" >> "$GITHUB_OUTPUT"
-          else
-            echo "⚠ Tidak ada kmod-*.apk ditemukan di $PKGS_DIR"
-            echo "status=skip" >> "$GITHUB_OUTPUT"
-            echo "kmod_count=0" >> "$GITHUB_OUTPUT"
-          fi
-
-      # ── 19. Upload Actions Artifact ─────────────────────────────────
+      # ── 18. Upload Actions Artifact ─────────────────────────────────
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         if: steps.compile.outputs.status == 'success'
@@ -429,7 +345,7 @@ jobs:
           path: firmware/
           retention-days: 30
 
-      # ── 20. Create GitHub Release ───────────────────────────────────
+      # ── 19. Create GitHub Release ───────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: >
