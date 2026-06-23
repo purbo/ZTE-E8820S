@@ -27,7 +27,7 @@ on:
 
 env:
   OPENWRT_REPO:   https://github.com/openwrt/openwrt.git
-  OPENWRT_TAG:    ${{ github.event.inputs.openwrt_tag || 'v25.12.3' }}
+  OPENWRT_TAG:    ${{ github.event.inputs.openwrt_tag || 'v25.12.4' }}
   TARGET:         ramips
   SUBTARGET:      mt7621
   DEVICE_PROFILE: zte_e8820s
@@ -42,7 +42,7 @@ env:
 
 jobs:
   build:
-    name: Compile ZTE E8820S – OpenWrt ${{ github.event.inputs.openwrt_tag || 'v25.12.3' }}
+    name: Compile ZTE E8820S – OpenWrt ${{ github.event.inputs.openwrt_tag || 'v25.12.4' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
